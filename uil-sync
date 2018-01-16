@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+
+import gi
+import json
+import os, sys
+import pathlib
+import threading
+import subprocess
+import rsyncjob
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('GLib', '2.0')
+from gi.repository import Gtk, GObject, GLib
+
+PROGRAM_NAME        = "uil-sync"
+PROGRAM_VISUAL_NAME = "Uil-OTS labdata sync tool"
+CONFIG_NAME         = "config.json"
+
+class ConfigDataModel(dict):
+    '''The datamodel stores the source and destination directory for the data.
+    This data is stored when the program closes in a user config directory. On
+    each start of the program it is examined whether this file exists and
+    '''
+    
+    DEST    = "destination"
+    SOURCE  = "source"
+    CONFIG  = "config"
+    
+    def __init__(
+            self,
+            source=pathlib.Path('.'),
+            destination=pathlib.Path('.')
+            ):
+        super().__init__()
+        self[self.CONFIG]   = str(config_file(PROGRAM_NAME, CONFIG_NAME))
+        self[self.SOURCE]   = str(source)
+        self[self.DEST]     = str(destination)
+
+    def save(self):
+        with open(self[ConfigDataModel.CONFIG], 'w') as f:
+            s = json.dumps(self,indent='\t')
+            f.write(s)
+    
+    @staticmethod
+    def from_file(path):
+        model = ConfigDataModel()
+        with path.open() as f:
+            try:
+                jsonstr = f.read()
+                filedict = json.loads(jsonstr)
+                for key, value in filedict.items():
+                    model[key] = value
+            except json.JSONDecodeError as e:
+                print("Unable to decode {}".format(path), file=sys.stderr)
+                print("No worries, we use a default config", file=sys.stderr)
+        return model
+
+
+class DataModel(dict):
+    ''' Stores the internal model of the uil-sync program'''
+
+    RED     = "red"
+    BLACK   = "black"
+
+    def __init__(self, config, mainwin):
+        self.configuration  = config
+        self.mainwin        = mainwin
+        self.thread         = None
+        self.timeout_id     = None
+        self.progress       = Gtk.TextBuffer()
+
+        self.red_tag = self.progress.create_tag(
+            tag_name=self.RED, foreground=self.RED
+            ) 
+
+        self.black_tag = self.progress.create_tag(
+            tag_name=self.BLACK,
+            foreground=self.BLACK
+            )
+
+    def save_config(self):
+        self.configuration.save()
+
+    def start_syncronisation(self, update_interval_s=1):
+        '''Start the synchronization in a thread and start a timeout to
+        monitor the thread.
+        '''
+        if not self.is_syncing():
+            # new job, new progress
+            self.progress.set_text("")
+            source = self.configuration[self.configuration.SOURCE]
+            dest   = self.configuration[self.configuration.DEST]
+            self.thread = rsyncjob.ThreadedRSync(source, dest)
+            self.thread.start()
+            self.timeout_id = GLib.timeout_add_seconds(
+                1,
+                self.monitor_thread,
+                )
+            self.mainwin.update_from_model()
+
+    def is_syncing(self):
+        '''Determines whether the thread is running'''
+        return self.thread != None and not self.thread.finished
+
+    def _append_text_with_tags(self, text, *tags):
+        '''Appends text with a given tag to the end of the buffer.'''
+        enditer = self.progress.get_end_iter()
+        self.progress.insert_with_tags(enditer, text, *tags)
+        
+    def _append_text(self, fileno, text):
+        '''Inserts text in the Text buffer. text from stdout should be
+        black and stderr should be red.'''
+        if not text: 
+            return
+
+        red_tag = Gtk.TextTag
+
+        if fileno == 1:
+            self._append_text_with_tags(text, self.black_tag)
+        elif fileno == 2:
+            self._append_text_with_tags(text, self.red_tag)
+        else:
+            assert(fileno == 1 or fileno == 2)
+
+
+    def _read_queue(self):
+        '''Empties queue'''
+        assert(self.thread != None)
+        while not self.thread.queue.empty():
+            msg = self.thread.queue.get(False)
+            #print(msg[0], msg[1], end="")
+            self._append_text(msg[0], msg[1])
+
+    def monitor_thread(self, *args):
+        '''Checks the progress of the RSyncThread.'''
+        self._read_queue()
+        if not self.is_syncing():
+            self.timeout_id = None
+            if self.thread:
+                self.thread.join()
+            self._read_queue()
+            self.thread  = None
+            return False
+
+        return True
+
+
+def config_dir(appname=""):
+    '''Looks up application config dir in confirmation with XDG specs'''
+    XDG_CONFIG_VAR = 'XDG_CONFIG_HOME'
+    HOME_VAR       = 'HOME'
+
+    try:
+        cdir = os.environ[XDG_CONFIG_VAR]
+    except KeyError as e:
+        homedir = os.environ[HOME_VAR]
+        cdir = homedir + "/.config/".format(appname)
+
+    cdir += "/{}".format(appname)
+    return pathlib.Path(cdir)
+
+def config_file(appname, filename):
+    '''Returns the name of the application file'''
+    return config_dir(appname) / filename
+
+class SyncWin(Gtk.Window):
+    
+    SYNC_BUTTON_LABEL       = "sync"
+    SOURCE_BUTTON_LABEL     = "source folder"
+    DEST_BUTTON_LABEL       = "destination folder"
+
+    SOURCE_LABEL = "Sync from: {}"
+    DEST_LABEL   = "Sync to: {}"
+
+    SPACING = 5
+
+    def __init__(self, datamodel, *args, **kwargs):
+        super(SyncWin, self).__init__(*args, **kwargs)
+        self.model = datamodel
+
+        layout = Gtk.Grid()
+        layout.set_border_width(self.SPACING)
+        layout.set_row_spacing(self.SPACING)
+        layout.set_column_spacing(self.SPACING)
+        #layout.set_column_homogeneous(False)
+        self.layout = layout
+
+        self.source_label = Gtk.Label(self.SOURCE_LABEL)
+        self.dest_label   = Gtk.Label(self.DEST_LABEL)
+        
+        self.source_label.set_alignment(0, 0.5)
+        self.dest_label.set_alignment(0, 0.5)
+
+        layout.attach(self.source_label, 0, 0, 1, 1)
+        layout.attach(self.dest_label, 0, 1, 1, 1)
+
+        self.text_scroll = Gtk.ScrolledWindow()
+        self.text_scroll.set_vexpand(True)
+        self.text_scroll.set_hexpand(True)
+        layout.attach(self.text_scroll, 0, 2, 2, 1)
+        self.text = Gtk.TextView.new_with_buffer(
+            self.model.progress
+            )
+        self.text_scroll.add(self.text)
+
+        self.hsep = Gtk.Separator()
+
+        self.syncbutton      = Gtk.Button(self.SYNC_BUTTON_LABEL)
+        self.destbutton      = Gtk.Button(label=self.DEST_BUTTON_LABEL)
+        self.sourcebutton    = Gtk.Button(label=self.SOURCE_BUTTON_LABEL)
+
+        self.syncbutton.hexpand  = False
+        self.destbutton.hexpand  = False
+        self.sourcebutton.hexpand= False
+        
+        self.sourcebutton.connect("clicked", self.update_source)
+        self.destbutton.connect("clicked", self.update_dest)
+        self.syncbutton.connect("clicked", self.sync)
+
+        layout.attach(self.sourcebutton , 1, 0, 1, 1)
+        layout.attach(self.destbutton   , 1, 1, 1, 1) 
+        layout.attach(self.hsep         , 0, 3, 2, 1)
+        layout.attach(self.syncbutton   , 1, 4, 1, 1)
+
+        self.update_from_model()
+
+        self.add(layout)
+
+        self.connect('delete-event', self.shut_down)
+    
+    def shut_down(self, widget, event):
+        Gtk.main_quit()
+        self.model.save_config()
+
+    def update_from_model(self):
+        '''Updates the gui to match the data model'''
+        config = self.model.configuration
+        label = self.SOURCE_LABEL.format(config[config.SOURCE])
+        self.source_label.set_text(label)
+        label = self.DEST_LABEL.format(config[config.DEST])
+        self.dest_label.set_text(label)
+
+    def get_folder(self, title):
+        '''Returns a foldername or None'''
+        dialog  = Gtk.FileChooserDialog(title, self,
+            Gtk.FileChooserAction.SELECT_FOLDER,
+            (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+             "select", Gtk.ResponseType.OK)
+            )
+        response = dialog.run()
+        result = None
+        if response == Gtk.ResponseType.OK:
+            result = dialog.get_filename()
+        dialog.destroy()
+        return result
+
+    def update_source(self, widget):
+        '''Update source name'''
+        dirname = self.get_folder("Select a source folder")
+        if dirname:
+            self.model.configuration[ConfigDataModel.SOURCE] = dirname
+        self.update_from_model()
+
+    def update_dest(self, widget):
+        '''Update destination name'''
+        dirname = self.get_folder("Select a destination folder")
+        if dirname:
+            self.model.configuration[ConfigDataModel.DEST] = dirname
+        self.update_from_model()
+    
+    def sync(self, widget):
+        '''Starts the syncronisation'''
+        self.model.start_syncronisation()
+        self.update_from_model()
+
+def get_config_data_model():
+    '''Gets the datamodel of uil sync.'''
+    cd = config_dir(PROGRAM_NAME)
+    if not cd.is_dir():
+        cd.mkdir()
+    configfile = cd / CONFIG_NAME
+    if not configfile.exists():
+        configfile.touch()
+    model = ConfigDataModel.from_file(configfile)
+    return model
+
+if __name__ == "__main__":
+
+    configmodel = get_config_data_model()
+    datamodel = DataModel(configmodel, None)
+    win = SyncWin(datamodel,
+                  title=PROGRAM_VISUAL_NAME)
+    datamodel.mainwin = win 
+
+    win.show_all()
+    Gtk.main()
